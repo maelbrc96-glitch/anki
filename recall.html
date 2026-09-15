@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#fafafa" />
+  <title>Recall — Révision</title>
+  <script src="https://unpkg.com/react@19.1.1/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@19.1.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-type="module" data-presets="react,typescript">
+const { useEffect, useMemo, useState } = React;
+
+
+type Rating = "again" | "hard" | "good" | "easy";
+
+type Deck = {
+  id: string;
+  name: string;
+  parentId: string | null;
+  createdAt: number;
+};
+
+type Card = {
+  id: string;
+  deckId: string;
+  front: string;
+  back: string;
+  tags: string[];
+  createdAt: number;
+  due: number;
+  interval: number;
+  ease: number;
+  repetitions: number;
+  lapses: number;
+  lastReviewedAt: number | null;
+};
+
+type AppData = {
+  decks: Deck[];
+  cards: Card[];
+  reviews: { cardId: string; rating: Rating; at: number }[];
+  streak: number;
+  lastStudyDay: string | null;
+};
+
+const STORAGE_KEY = "recall-v1";
+
+const defaultData: AppData = {
+  decks: [],
+  cards: [],
+  reviews: [],
+  streak: 0,
+  lastStudyDay: null,
+};
+
+function uid() {
+  return crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function loadData(): AppData {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return defaultData;
+    const parsed = JSON.parse(raw);
+    return {
+      ...defaultData,
+      ...parsed,
+      decks: parsed.decks ?? [],
+      cards: parsed.cards ?? [],
+      reviews: parsed.reviews ?? [],
+    };
+  } catch {
+    return defaultData;
+  }
+}
+
+function saveData(data: AppData) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+}
+
+function normalizeTag(s: string) {
+  return s.trim().replace(/^#/, "").toLowerCase();
+}
+
+function formatDate(ts: number) {
+  return new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(ts);
+}
+
+function dayDiff(a: Date, b: Date) {
+  const aa = new Date(a.getFullYear(), a.getMonth(), a.getDate()).getTime();
+  const bb = new Date(b.getFullYear(), b.getMonth(), b.getDate()).getTime();
+  return Math.round((aa - bb) / 86400000);
+}
+
+function nextInterval(card: Card, rating: Rating) {
+  const old = Math.max(0, card.interval);
+  const ease = card.ease || 2.5;
+
+  if (rating === "again") return { interval: 0, ease: Math.max(1.3, ease - 0.2) };
+  if (rating === "hard") return { interval: Math.max(1, Math.round(Math.max(1, old) * 1.2)), ease: Math.max(1.3, ease - 0.15) };
+  if (rating === "good") {
+    const base = old < 1 ? 1 : old < 6 ? old + 2 : old * ease;
+    return { interval: Math.max(1, Math.round(base)), ease: Math.min(3.0, ease + 0.02) };
+  }
+  return { interval: Math.max(2, Math.round(Math.max(1, old) * Math.max(2.5, ease + 0.35))), ease: Math.min(3.2, ease + 0.08) };
+}
+
+function escapeHtml(s: string) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function DeckTree({
+  decks,
+  selected,
+  onSelect,
+  onAdd,
+  depth = 0,
+}: {
+  decks: Deck[];
+  selected: string | null;
+  onSelect: (id: string) => void;
+  onAdd: (parentId: string) => void;
+  depth?: number;
+}) {
+  return (
+    <>
+      {decks.map((deck) => {
+        const children = allChildren(deck.id, decks);
+        return (
+          <div key={deck.id}>
+            <div
+              className={`deck-row ${selected === deck.id ? "selected" : ""}`}
+              style={{ paddingLeft: 12 + depth * 18 }}
+            >
+              <button className="deck-name" onClick={() => onSelect(deck.id)}>
+                <span className="chevron">{children.length ? "›" : "·"}</span>
+                {deck.name}
+              </button>
+              <button className="tiny-btn" onClick={() => onAdd(deck.id)} aria-label="Créer un sous-deck">+</button>
+            </div>
+            {children.length > 0 && (
+              <DeckTree decks={decks} selected={selected} onSelect={onSelect} onAdd={onAdd} depth={depth + 1} />
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function allChildren(id: string, decks: Deck[]) {
+  return decks.filter((d) => d.parentId === id);
+}
+
+function descendantIds(id: string, decks: Deck[]): string[] {
+  const out = [id];
+  for (const d of decks.filter((x) => x.parentId === id)) out.push(...descendantIds(d.id, decks));
+  return out;
+}
+
+function App() {
+  const [data, setData] = useState<AppData>(() => loadData());
+  const [page, setPage] = useState<"home" | "review" | "decks" | "stats">("home");
+  const [selectedDeck, setSelectedDeck] = useState<string | null>(null);
+  const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const [reviewDeck, setReviewDeck] = useState<string | null>(null);
+  const [reviewQueue, setReviewQueue] = useState<string[]>([]);
+  const [reviewIndex, setReviewIndex] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [sessionStarted, setSessionStarted] = useState<number | null>(null);
+  const [sessionDone, setSessionDone] = useState(false);
+  const [tab, setTab] = useState<"visual" | "export">("visual");
+  const [toast, setToast] = useState("");
+  const [search, setSearch] = useState("");
+  const [showAddDeck, setShowAddDeck] = useState(false);
+  const [showAddCard, setShowAddCard] = useState(false);
+  const [editingCard, setEditingCard] = useState<Card | null>(null);
+  const [showImport, setShowImport] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => saveData(data), [data]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(""), 2200);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const today = Date.now();
+  const allTags = useMemo(() => {
+    const set = new Set<string>();
+    data.cards.forEach((c) => c.tags.forEach((t) => set.add(t)));
+    return [...set].sort();
+  }, [data.cards]);
+
+  const dueCards = useMemo(() => {
+    let cards = data.cards.filter((c) => c.due <= today);
+    if (reviewDeck) {
+      const ids = descendantIds(reviewDeck, data.decks);
+      cards = cards.filter((c) => ids.includes(c.deckId));
+    }
+    if (selectedTag) cards = cards.filter((c) => c.tags.includes(selectedTag));
+    return cards;
+  }, [data.cards, data.decks, today, reviewDeck, selectedTag]);
+
+  const currentCard = reviewQueue.length ? data.cards.find((c) => c.id === reviewQueue[reviewIndex]) : undefined;
+
+  const deckCards = selectedDeck
+    ? data.cards.filter((c) => descendantIds(selectedDeck, data.decks).includes(c.deckId))
+    : [];
+
+  const filteredDeckCards = deckCards.filter((c) => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return c.front.toLowerCase().includes(q) || c.back.toLowerCase().includes(q) || c.tags.some((t) => t.includes(q));
+  });
+
+  const todayReviews = data.reviews.filter((r) => dayDiff(new Date(r.at), new Date()) === 0);
+  const weekReviews = data.reviews.filter((r) => Date.now() - r.at < 7 * 86400000);
+  const success = data.reviews.length
+    ? Math.round((data.reviews.filter((r) => r.rating === "good" || r.rating === "easy").length / data.reviews.length) * 100)
+    : 0;
+
+  function notify(message: string) {
+    setToast(message);
+  }
+
+  function createDeck(name: string, parentId: string | null = null) {
+    const clean = name.trim();
+    if (!clean) return;
+    setData((d) => ({ ...d, decks: [...d.decks, { id: uid(), name: clean, parentId, createdAt: Date.now() }] }));
+    setShowAddDeck(false);
+    notify("Deck créé");
+  }
+
+  function deleteDeck(id: string) {
+    const ids = descendantIds(id, data.decks);
+    const parent = data.decks.find((d) => d.id === id)?.parentId ?? null;
+    setData((d) => ({
+      ...d,
+      decks: d.decks.filter((x) => !ids.includes(x.id)).map((x) => (x.parentId && ids.includes(x.parentId) ? { ...x, parentId: parent } : x)),
+      cards: d.cards.filter((c) => !ids.includes(c.deckId)),
+    }));
+    setSelectedDeck(null);
+    notify("Deck supprimé");
+  }
+
+  function startReview(deckId: string | null = null, tag: string | null = null) {
+    const ids = deckId ? descendantIds(deckId, data.decks) : null;
+    const cards = data.cards
+      .filter((c) => c.due <= Date.now())
+      .filter((c) => !ids || ids.includes(c.deckId))
+      .filter((c) => !tag || c.tags.includes(tag))
+      .sort((a, b) => a.due - b.due);
+    setReviewDeck(deckId);
+    setSelectedTag(tag);
+    setReviewQueue(cards.map((c) => c.id));
+    setReviewIndex(0);
+    setRevealed(false);
+    setSessionDone(false);
+    setSessionStarted(Date.now());
+    setPage("review");
+  }
+
+  function answer(rating: Rating) {
+    if (!currentCard) return;
+    const result = nextInterval(currentCard, rating);
+    const now = Date.now();
+    let interval = result.interval;
+    if (rating === "again") interval = 0.02;
+    const updated: Card = {
+      ...currentCard,
+      interval,
+      ease: result.ease,
+      repetitions: rating === "again" ? 0 : currentCard.repetitions + 1,
+      lapses: rating === "again" ? currentCard.lapses + 1 : currentCard.lapses,
+      lastReviewedAt: now,
+      due: now + interval * 86400000,
+    };
+    setData((d) => ({
+      ...d,
+      cards: d.cards.map((c) => (c.id === updated.id ? updated : c)),
+      reviews: [...d.reviews, { cardId: updated.id, rating, at: now }],
+      streak: d.lastStudyDay === todayKey() ? d.streak : d.streak + 1,
+      lastStudyDay: todayKey(),
+    }));
+    if (reviewIndex + 1 >= reviewQueue.length) {
+      setSessionDone(true);
+    } else {
+      setReviewIndex((i) => i + 1);
+      setRevealed(false);
+    }
+  }
+
+  function upsertCard(fields: { deckId: string; front: string; back: string; tags: string[] }, id?: string) {
+    if (!fields.front.trim() || !fields.back.trim()) return;
+    const tags = fields.tags.map(normalizeTag).filter(Boolean).filter((x, i, a) => a.indexOf(x) === i);
+    if (id) {
+      setData((d) => ({ ...d, cards: d.cards.map((c) => c.id === id ? { ...c, ...fields, tags } : c) }));
+      setEditingCard(null);
+      notify("Carte modifiée");
+    } else {
+      const card: Card = {
+        id: uid(), deckId: fields.deckId, front: fields.front.trim(), back: fields.back.trim(), tags,
+        createdAt: Date.now(), due: Date.now(), interval: 0, ease: 2.5, repetitions: 0, lapses: 0, lastReviewedAt: null
+      };
+      setData((d) => ({ ...d, cards: [...d.cards, card] }));
+      setShowAddCard(false);
+      notify("Carte ajoutée");
+    }
+  }
+
+  function deleteCard(id: string) {
+    setData((d) => ({ ...d, cards: d.cards.filter((c) => c.id !== id), reviews: d.reviews.filter((r) => r.cardId !== id) }));
+    notify("Carte supprimée");
+  }
+
+  function exportTSV() {
+    const cards = selectedDeck ? deckCards : data.cards;
+    const text = cards.map((c) => `${c.front.replace(/\t/g, " ")}\t${c.back.replace(/\t/g, " ")}\t${c.tags.join(",")}`).join("\n");
+    download(text, `${selectedDeck ? "deck" : "recall"}-cards.tsv`, "text/tab-separated-values");
+  }
+
+  function exportJSON() {
+    download(JSON.stringify(data, null, 2), "recall-backup.json", "application/json");
+  }
+
+  function download(text: string, filename: string, type: string) {
+    const blob = new Blob([text], { type });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function copyExport() {
+    const cards = selectedDeck ? deckCards : data.cards;
+    const text = cards.map((c) => `${c.front}\t${c.back}\t${c.tags.join(",")}`).join("\n");
+    navigator.clipboard?.writeText(text);
+    notify("Copié dans le presse-papier");
+  }
+
+  async function parseImport(file: File) {
+    const text = await file.text();
+    importText(text);
+  }
+
+  function importText(text: string) {
+    const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).filter((l) => l.trim());
+    const target = selectedDeck || data.decks[0]?.id;
+    if (!target) {
+      notify("Crée d'abord un deck");
+      return;
+    }
+    const imported: Card[] = [];
+    for (const line of lines) {
+      let parts: string[];
+      if (line.includes("\t")) parts = line.split("\t");
+      else if (line.includes(";")) parts = line.split(";");
+      else parts = line.split(",");
+      if (parts.length < 2) continue;
+      const front = parts[0].trim();
+      const back = parts.slice(1, parts.length >= 3 ? -1 : undefined).join(parts[0].includes(";") ? ";" : ",").trim() || parts[1].trim();
+      const tagText = parts.length >= 3 ? parts[parts.length - 1] : "";
+      if (!front || !back) continue;
+      imported.push({
+        id: uid(), deckId: target, front, back,
+        tags: tagText.split(",").map(normalizeTag).filter(Boolean),
+        createdAt: Date.now(), due: Date.now(), interval: 0, ease: 2.5, repetitions: 0, lapses: 0, lastReviewedAt: null
+      });
+    }
+    setData((d) => ({ ...d, cards: [...d.cards, ...imported] }));
+    setShowImport(false);
+    notify(`${imported.length} cartes importées`);
+  }
+
+  function importJSON(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result));
+        if (!Array.isArray(parsed.decks) || !Array.isArray(parsed.cards)) throw new Error();
+        setData({
+          ...defaultData,
+          ...parsed,
+          reviews: Array.isArray(parsed.reviews) ? parsed.reviews : [],
+        });
+        notify("Sauvegarde restaurée");
+      } catch {
+        notify("Fichier JSON invalide");
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  return (
+    <div className="app">
+      <style>{CSS}</style>
+      <header className="topbar">
+        <button className="brand" onClick={() => setPage("home")}>
+          <span className="brand-mark">R</span><span>Recall</span>
+        </button>
+        <div className="top-actions">
+          <button className="icon-btn" onClick={() => setShowSettings(true)} title="Paramètres">⚙</button>
+        </div>
+      </header>
+
+      <main className="main">
+        {page === "home" && (
+          <Home
+            data={data} due={data.cards.filter(c => c.due <= Date.now()).length}
+            todayReviews={todayReviews.length} streak={data.streak}
+            onReview={() => startReview()} onDecks={() => setPage("decks")}
+          />
+        )}
+
+        {page === "decks" && (
+          <DecksPage
+            data={data} selectedDeck={selectedDeck} setSelectedDeck={setSelectedDeck}
+            onAddDeck={() => setShowAddDeck(true)}
+            onAddChild={(id) => { setSelectedDeck(id); setShowAddDeck(true); }}
+            onReview={startReview}
+            onImport={() => setShowImport(true)}
+            onAddCard={() => setShowAddCard(true)}
+            onDeleteDeck={deleteDeck}
+            deckCards={filteredDeckCards}
+            search={search} setSearch={setSearch}
+            onEdit={setEditingCard} onDeleteCard={deleteCard}
+            tags={allTags} selectedTag={selectedTag} setSelectedTag={setSelectedTag}
+            exportTSV={exportTSV}
+          />
+        )}
+
+        {page === "review" && (
+          <ReviewPage
+            card={currentCard} index={reviewIndex} total={reviewQueue.length}
+            revealed={revealed} setRevealed={setRevealed}
+            onAnswer={answer} done={sessionDone}
+            duration={sessionStarted ? Math.max(1, Math.round((Date.now() - sessionStarted) / 60000)) : 0}
+            onHome={() => setPage("home")}
+            onDecks={() => setPage("decks")}
+          />
+        )}
+
+        {page === "stats" && (
+          <StatsPage data={data} today={todayReviews.length} week={weekReviews.length} success={success} />
+        )}
+      </main>
+
+      <nav className="bottom-nav">
+        <NavButton active={page === "home"} onClick={() => setPage("home")} label="Accueil" icon="⌂" />
+        <NavButton active={page === "review"} onClick={() => startReview()} label="Réviser" icon="◉" badge={dueCards.length} />
+        <NavButton active={page === "decks"} onClick={() => setPage("decks")} label="Decks" icon="▤" />
+        <NavButton active={page === "stats"} onClick={() => setPage("stats")} label="Stats" icon="↗" />
+      </nav>
+
+      {toast && <div className="toast">{toast}</div>}
+
+      {showAddDeck && (
+        <Modal title={selectedDeck ? "Nouveau sous-deck" : "Nouveau deck"} onClose={() => setShowAddDeck(false)}>
+          <DeckForm initial="" onSubmit={(name) => createDeck(name, selectedDeck)} />
+        </Modal>
+      )}
+
+      {(showAddCard || editingCard) && (
+        <Modal title={editingCard ? "Modifier la carte" : "Nouvelle carte"} onClose={() => { setShowAddCard(false); setEditingCard(null); }}>
+          <CardForm
+            decks={data.decks}
+            initial={editingCard ?? undefined}
+            defaultDeck={selectedDeck || data.decks[0]?.id || ""}
+            onSubmit={(f) => upsertCard(f, editingCard?.id)}
+          />
+        </Modal>
+      )}
+
+      {showImport && (
+        <Modal title="Importer des cartes" onClose={() => setShowImport(false)}>
+          <ImportBox onFile={parseImport} onText={importText} />
+        </Modal>
+      )}
+
+      {showSettings && (
+        <Modal title="Données" onClose={() => setShowSettings(false)}>
+          <div className="settings">
+            <p className="muted">Tout est stocké localement dans ce navigateur.</p>
+            <button className="secondary full" onClick={exportJSON}>Exporter une sauvegarde JSON</button>
+            <label className="secondary full file-label">
+              Restaurer une sauvegarde JSON
+              <input type="file" accept=".json,application/json" onChange={(e) => e.target.files?.[0] && importJSON(e.target.files[0])} />
+            </label>
+            <button className="danger full" onClick={() => {
+              if (confirm("Supprimer toutes les données ? Cette action est irréversible.")) {
+                setData(defaultData); setSelectedDeck(null); notify("Données supprimées"); setShowSettings(false);
+              }
+            }}>Réinitialiser les données</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function NavButton({ active, onClick, label, icon, badge }: { active: boolean; onClick: () => void; label: string; icon: string; badge?: number }) {
+  return <button className={`nav-item ${active ? "active" : ""}`} onClick={onClick}>
+    <span className="nav-icon">{icon}{badge ? <b>{badge > 99 ? "99+" : badge}</b> : null}</span>
+    <span>{label}</span>
+  </button>;
+}
+
+function Home({ data, due, todayReviews, streak, onReview, onDecks }: any) {
+  const total = data.cards.length;
+  const progress = total ? Math.min(100, Math.round((todayReviews / Math.max(1, due + todayReviews)) * 100)) : 0;
+  return <section className="page">
+    <div className="hero">
+      <div>
+        <p className="eyebrow">RÉVISION</p>
+        <h1>Prêt pour une session ?</h1>
+        <p className="muted">Travaille régulièrement. Recall s'occupe du rythme.</p>
+      </div>
+      <button className="primary large" onClick={onReview} disabled={!due}>{due ? `Réviser ${due} carte${due > 1 ? "s" : ""}` : "Tout est à jour"}</button>
+    </div>
+
+    <div className="stats-grid">
+      <Stat label="À revoir" value={due} />
+      <Stat label="Révisées aujourd'hui" value={todayReviews} />
+      <Stat label="Cartes" value={total} />
+      <Stat label="Série" value={`${streak} j`} />
+    </div>
+
+    <div className="section-head"><h2>Mes decks</h2><button className="text-btn" onClick={onDecks}>Voir tout</button></div>
+    <div className="deck-cards">
+      {data.decks.slice(0, 6).map((d: Deck) => {
+        const ids = descendantIds(d.id, data.decks);
+        const count = data.cards.filter((c: Card) => ids.includes(c.deckId)).length;
+        const dueCount = data.cards.filter((c: Card) => ids.includes(c.deckId) && c.due <= Date.now()).length;
+        return <button key={d.id} className="home-deck" onClick={onDecks}>
+          <span className="deck-square">{d.name.charAt(0).toUpperCase()}</span>
+          <span className="home-deck-info"><strong>{d.name}</strong><small>{count} carte{count !== 1 ? "s" : ""}</small></span>
+          <span className="due">{dueCount || ""}</span>
+        </button>;
+      })}
+      {!data.decks.length && <div className="empty"><strong>Crée ton premier deck</strong><span>Ajoute des cartes manuellement ou importe un fichier.</span><button className="secondary" onClick={onDecks}>Commencer</button></div>}
+    </div>
+
+    <div className="progress-box">
+      <div><strong>Progression du jour</strong><span>{progress}%</span></div>
+      <div className="progress"><i style={{ width: `${progress}%` }} /></div>
+    </div>
+  </section>;
+}
+
+function Stat({ label, value }: { label: string; value: string | number }) {
+  return <div className="stat"><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function DecksPage(props: any) {
+  const { data, selectedDeck, setSelectedDeck, onAddDeck, onAddChild, onReview, onImport, onAddCard, onDeleteDeck, deckCards, search, setSearch, onEdit, onDeleteCard, tags, selectedTag, setSelectedTag, exportTSV } = props;
+  const current = data.decks.find((d: Deck) => d.id === selectedDeck);
+  return <section className="page">
+    <div className="page-title">
+      <div><p className="eyebrow">BIBLIOTHÈQUE</p><h1>Decks</h1></div>
+      <button className="primary" onClick={onAddDeck}>+ Nouveau deck</button>
+    </div>
+
+    <div className="decks-layout">
+      <aside className="deck-sidebar">
+        <DeckTree decks={data.decks.filter((d: Deck) => !d.parentId)} selected={selectedDeck} onSelect={setSelectedDeck} onAdd={onAddChild} />
+        {!data.decks.length && <p className="muted small">Aucun deck.</p>}
+      </aside>
+
+      <div className="deck-content">
+        {!current ? <div className="empty large-empty"><strong>Sélectionne un deck</strong><span>Ou crée-en un nouveau pour commencer.</span></div> :
+          <>
+            <div className="deck-header">
+              <div><p className="eyebrow">DECK</p><h2>{current.name}</h2><p className="muted">{deckCards.length} carte{deckCards.length !== 1 ? "s" : ""}</p></div>
+              <div className="button-row">
+                <button className="primary" onClick={() => onReview(current.id)}>Réviser</button>
+                <button className="secondary" onClick={onAddCard}>+ Carte</button>
+                <button className="secondary" onClick={onImport}>Importer</button>
+                <button className="secondary" onClick={exportTSV}>Exporter</button>
+                <button className="danger" onClick={() => onDeleteDeck(current.id)}>Supprimer</button>
+              </div>
+            </div>
+
+            <div className="tag-bar">
+              <button className={!selectedTag ? "tag active-tag" : "tag"} onClick={() => setSelectedTag(null)}>Tous</button>
+              {tags.map((t: string) => <button key={t} className={selectedTag === t ? "tag active-tag" : "tag"} onClick={() => setSelectedTag(selectedTag === t ? null : t)}>#{t}</button>)}
+            </div>
+
+            <input className="search" placeholder="Rechercher dans les cartes..." value={search} onChange={e => setSearch(e.target.value)} />
+
+            <div className="cards-list">
+              {deckCards.length === 0 && <div className="empty"><strong>Ce deck est vide</strong><span>Ajoute une carte ou importe un fichier TSV/TXT/CSV.</span></div>}
+              {deckCards.length > 0 && deckCards.map((c: Card) => <div className="card-row" key={c.id}>
+                <div className="card-text"><strong>{c.front}</strong><span>{c.back}</span><div className="tag-line">{c.tags.map(t => <em key={t}>#{t}</em>)}</div></div>
+                <div className="card-meta"><small>Prochaine : {c.due <= Date.now() ? "maintenant" : formatDate(c.due)}</small><div><button className="text-btn" onClick={() => onEdit(c)}>Modifier</button><button className="text-btn danger-text" onClick={() => onDeleteCard(c.id)}>Supprimer</button></div></div>
+              </div>)}
+            </div>
+          </>
+        }
+      </div>
+    </div>
+  </section>;
+}
+
+function ReviewPage({ card, index, total, revealed, setRevealed, onAnswer, done, duration, onHome, onDecks }: any) {
+  if (done || !card) return <section className="review-page done-page">
+    <div className="done-icon">✓</div><p className="eyebrow">SESSION TERMINÉE</p><h1>Bon travail.</h1>
+    <p className="muted">Tu as terminé les {total} carte{total !== 1 ? "s" : ""} de cette session.</p>
+    <div className="stats-grid compact"><Stat label="Cartes" value={total} /><Stat label="Durée" value={`${duration} min`} /></div>
+    <div className="button-row center"><button className="primary" onClick={onHome}>Accueil</button><button className="secondary" onClick={onDecks}>Voir les decks</button></div>
+  </section>;
+
+  return <section className="review-page">
+    <div className="review-top"><button className="text-btn" onClick={onHome}>Quitter</button><span>{index + 1} / {total}</span></div>
+    <div className="review-progress"><i style={{ width: `${((index) / Math.max(1,total))*100}%` }} /></div>
+    <div className="flashcard">
+      <div className="card-label">RECTO</div>
+      <div className="flash-content">{formatCardText(card.front)}</div>
+      {!revealed ? <button className="primary reveal" onClick={() => setRevealed(true)}>Afficher la réponse</button> :
+        <>
+          <div className="divider" />
+          <div className="card-label">VERSO</div>
+          <div className="flash-answer">{formatCardText(card.back)}</div>
+          {card.tags.length > 0 && <div className="tag-line center-tags">{card.tags.map((t: string) => <em key={t}>#{t}</em>)}</div>}
+        </>}
+    </div>
+    {revealed && <div className="rating-grid">
+      <button onClick={() => onAnswer("again")}><strong>À revoir</strong><small>Très bientôt</small></button>
+      <button onClick={() => onAnswer("hard")}><strong>Difficile</strong><small>+ court</small></button>
+      <button onClick={() => onAnswer("good")}><strong>Bien</strong><small>Normal</small></button>
+      <button onClick={() => onAnswer("easy")}><strong>Facile</strong><small>+ long</small></button>
+    </div>}
+  </section>;
+}
+
+function formatCardText(text: string) {
+  return <div dangerouslySetInnerHTML={{ __html: escapeHtml(text).replace(/\n/g, "<br>") }} />;
+}
+
+function StatsPage({ data, today, week, success }: any) {
+  const reviewedCards = new Set(data.reviews.map((r: any) => r.cardId)).size;
+  const mastered = data.cards.filter((c: Card) => c.repetitions >= 5 && c.interval >= 21).length;
+  return <section className="page">
+    <div className="page-title"><div><p className="eyebrow">ANALYSE</p><h1>Statistiques</h1></div></div>
+    <div className="stats-grid">
+      <Stat label="Aujourd'hui" value={today} />
+      <Stat label="Cette semaine" value={week} />
+      <Stat label="Taux de réussite" value={`${success}%`} />
+      <Stat label="Cartes étudiées" value={reviewedCards} />
+    </div>
+    <div className="stat-panels">
+      <div className="panel"><h3>Maîtrise</h3><div className="big-number">{mastered}<span> / {data.cards.length}</span></div><p className="muted">Cartes avec un intervalle d'au moins 21 jours et plusieurs répétitions.</p><div className="progress"><i style={{ width: `${data.cards.length ? mastered / data.cards.length * 100 : 0}%` }}/></div></div>
+      <div className="panel"><h3>Révisions</h3><div className="bar-chart">{[6,5,4,3,2,1,0].map((offset) => {
+        const d = new Date(); d.setDate(d.getDate() - offset);
+        const n = data.reviews.filter((r: any) => dayDiff(new Date(r.at), d) === 0).length;
+        return <div className="bar-col" key={offset}><div className="bar" style={{ height: `${Math.max(6, Math.min(100, n * 9))}%` }} /><small>{d.toLocaleDateString("fr-FR",{weekday:"short"}).slice(0,2)}</small></div>;
+      })}</div></div>
+    </div>
+  </section>;
+}
+
+function Modal({ title, onClose, children }: any) {
+  return <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) onClose(); }}>
+    <div className="modal"><div className="modal-head"><h2>{title}</h2><button className="icon-btn" onClick={onClose}>×</button></div>{children}</div>
+  </div>;
+}
+
+function DeckForm({ initial, onSubmit }: { initial: string; onSubmit: (v: string) => void }) {
+  const [name, setName] = useState(initial);
+  return <form onSubmit={e => { e.preventDefault(); onSubmit(name); }}>
+    <label>Nom du deck<input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="Ex. Mathématiques" /></label>
+    <button className="primary full" type="submit">Créer</button>
+  </form>;
+}
+
+function CardForm({ decks, initial, defaultDeck, onSubmit }: any) {
+  const [deckId, setDeckId] = useState(initial?.deckId || defaultDeck);
+  const [front, setFront] = useState(initial?.front || "");
+  const [back, setBack] = useState(initial?.back || "");
+  const [tags, setTags] = useState((initial?.tags || []).join(", "));
+  return <form onSubmit={e => { e.preventDefault(); onSubmit({ deckId, front, back, tags: tags.split(",") }); }}>
+    <label>Deck<select value={deckId} onChange={e => setDeckId(e.target.value)}>{decks.map((d: Deck) => <option key={d.id} value={d.id}>{d.name}</option>)}</select></label>
+    <label>Recto<textarea autoFocus value={front} onChange={e => setFront(e.target.value)} placeholder="Question..." /></label>
+    <label>Verso<textarea value={back} onChange={e => setBack(e.target.value)} placeholder="Réponse..." /></label>
+    <label>Tags <span className="muted">(séparés par des virgules)</span><input value={tags} onChange={e => setTags(e.target.value)} placeholder="formules, chapitre-1, important" /></label>
+    <button className="primary full" type="submit">{initial ? "Enregistrer" : "Ajouter la carte"}</button>
+  </form>;
+}
+
+function ImportBox({ onFile, onText }: any) {
+  const [text, setText] = useState("");
+  return <div>
+    <p className="muted">Format recommandé : <b>Recto[TAB]Verso[TAB]tag1,tag2</b>. Une carte par ligne.</p>
+    <label className="file-label secondary full">Choisir un fichier TXT / TSV / CSV<input type="file" accept=".txt,.tsv,.csv,text/plain,text/csv" onChange={e => e.target.files?.[0] && onFile(e.target.files[0])}/></label>
+    <div className="or">ou colle tes cartes</div>
+    <textarea className="import-text" value={text} onChange={e => setText(e.target.value)} placeholder={"Question 1\tRéponse 1\tchapitre1\nQuestion 2\tRéponse 2\timportant"} />
+    <button className="primary full" disabled={!text.trim()} onClick={() => onText(text)}>Importer le texte</button>
+  </div>;
+}
+
+const CSS = `
+*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#fafafa;color:#171717}button,input,textarea,select{font:inherit}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.app{min-height:100vh;padding-bottom:76px}.topbar{height:62px;border-bottom:1px solid #e8e8e8;background:rgba(250,250,250,.94);display:flex;align-items:center;justify-content:space-between;padding:0 max(18px,calc((100vw - 1100px)/2));position:sticky;top:0;z-index:20;backdrop-filter:blur(10px)}.brand{border:0;background:none;display:flex;align-items:center;gap:9px;font-weight:750;font-size:17px;color:#171717}.brand-mark{display:grid;place-items:center;width:27px;height:27px;border:1px solid #171717;border-radius:8px;font-size:13px}.top-actions{display:flex;gap:6px}.icon-btn{border:1px solid #e2e2e2;background:#fff;border-radius:9px;width:36px;height:36px;color:#555}.main{max-width:1100px;margin:0 auto;padding:30px 18px}.page{animation:appear .22s ease}@keyframes appear{from{opacity:.2;transform:translateY(4px)}to{opacity:1;transform:none}}.hero{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin:22px 0 30px}.eyebrow{font-size:11px;letter-spacing:.12em;color:#858585;font-weight:700;margin:0 0 7px}h1{font-size:clamp(28px,5vw,42px);letter-spacing:-.04em;margin:0 0 8px;line-height:1.05}h2{font-size:24px;letter-spacing:-.025em;margin:0}h3{font-size:16px;margin:0 0 18px}.muted{color:#777}.small{font-size:13px}.primary,.secondary,.danger{border-radius:9px;border:1px solid #171717;padding:10px 14px;min-height:42px;font-weight:650}.primary{background:#171717;color:#fff}.primary.large{padding:13px 18px}.secondary{background:#fff;border-color:#dedede;color:#222}.danger{background:#fff;border-color:#e4caca;color:#9b3333}.full{width:100%;margin-top:8px}.text-btn{border:0;background:none;color:#555;padding:5px 7px}.danger-text{color:#a33}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:32px}.stat{background:#fff;border:1px solid #e7e7e7;border-radius:12px;padding:16px}.stat span{display:block;font-size:12px;color:#777;margin-bottom:9px}.stat strong{font-size:25px;letter-spacing:-.03em}.section-head,.page-title,.deck-header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin:28px 0 14px}.deck-cards{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.home-deck{display:flex;align-items:center;gap:12px;text-align:left;border:1px solid #e6e6e6;background:#fff;border-radius:11px;padding:13px}.deck-square{display:grid;place-items:center;width:37px;height:37px;border-radius:9px;background:#f1f1f1;font-weight:750}.home-deck-info{display:flex;flex-direction:column;gap:3px;flex:1}.home-deck-info small{color:#888}.due{font-weight:700}.progress-box,.panel{background:#fff;border:1px solid #e6e6e6;border-radius:12px;padding:17px;margin-top:18px}.progress-box>div:first-child{display:flex;justify-content:space-between;font-size:13px;margin-bottom:12px}.progress{height:6px;background:#ededed;border-radius:99px;overflow:hidden}.progress i{display:block;height:100%;background:#171717;border-radius:99px}.empty{border:1px dashed #d9d9d9;border-radius:12px;padding:35px 20px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:8px;color:#777}.empty strong{color:#333}.empty .secondary{margin-top:10px}.decks-layout{display:grid;grid-template-columns:230px 1fr;gap:25px}.deck-sidebar{border-right:1px solid #e6e6e6;padding-right:12px}.deck-row{display:flex;align-items:center;border-radius:8px;margin:2px 0}.deck-row.selected{background:#ededed}.deck-name{border:0;background:none;flex:1;text-align:left;padding:9px 4px;color:#333;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chevron{display:inline-block;width:17px;color:#999}.tiny-btn{border:0;background:none;color:#888;padding:7px}.button-row{display:flex;flex-wrap:wrap;gap:7px}.deck-header{align-items:flex-start}.deck-header .button-row{justify-content:flex-end}.tag-bar{display:flex;gap:6px;overflow:auto;padding:2px 0 10px}.tag{border:1px solid #e0e0e0;background:#fff;border-radius:99px;padding:7px 10px;white-space:nowrap;color:#666}.active-tag{background:#171717;color:#fff;border-color:#171717}.search,input,textarea,select{border:1px solid #ddd;background:#fff;border-radius:9px;padding:11px 12px;outline:none;width:100%}.search:focus,input:focus,textarea:focus,select:focus{border-color:#999}.search{margin:4px 0 12px}.cards-list{border-top:1px solid #e8e8e8}.card-row{display:flex;justify-content:space-between;gap:15px;padding:16px 4px;border-bottom:1px solid #e8e8e8}.card-text{min-width:0;flex:1}.card-text strong,.card-text span{display:block}.card-text span{margin-top:6px;color:#666;font-size:14px}.tag-line{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}.tag-line em{font-style:normal;font-size:11px;color:#777;background:#f1f1f1;border-radius:99px;padding:3px 7px}.card-meta{display:flex;flex-direction:column;align-items:flex-end;gap:8px;color:#888}.card-meta small{white-space:nowrap}.review-page{max-width:720px;margin:0 auto;padding:15px 0 30px}.review-top{display:flex;justify-content:space-between;color:#777;font-size:13px;margin-bottom:9px}.review-progress{height:4px;background:#eee;border-radius:99px;overflow:hidden;margin-bottom:20px}.review-progress i{display:block;height:100%;background:#171717}.flashcard{min-height:390px;background:#fff;border:1px solid #ddd;border-radius:15px;padding:28px;display:flex;flex-direction:column}.card-label{font-size:10px;letter-spacing:.13em;color:#999;font-weight:700}.flash-content,.flash-answer{font-size:clamp(21px,4vw,30px);line-height:1.4;letter-spacing:-.02em;margin:auto 0;padding:35px 0}.flash-answer{font-size:19px;color:#333;margin:0;padding:20px 0}.reveal{width:100%;margin-top:auto}.divider{height:1px;background:#eee}.center-tags{justify-content:center}.rating-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:10px}.rating-grid button{border:1px solid #ddd;background:#fff;border-radius:10px;padding:12px 7px;display:flex;flex-direction:column;gap:4px}.rating-grid small{color:#888}.done-page{text-align:center;padding:70px 10px}.done-icon{margin:0 auto 20px;width:55px;height:55px;border:1px solid #bbb;border-radius:50%;display:grid;place-items:center;font-size:23px}.compact{max-width:500px;margin:25px auto}.center{justify-content:center}.stat-panels{display:grid;grid-template-columns:1fr 1fr;gap:12px}.big-number{font-size:40px;font-weight:750;letter-spacing:-.05em}.big-number span{font-size:18px;color:#999}.bar-chart{height:150px;display:flex;align-items:end;justify-content:space-around;gap:8px;border-bottom:1px solid #ddd}.bar-col{height:100%;display:flex;flex-direction:column;justify-content:end;align-items:center;gap:7px;flex:1}.bar{width:100%;max-width:35px;background:#171717;border-radius:5px 5px 0 0;min-height:6px}.bar-col small{color:#999}.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.25);z-index:50;display:flex;align-items:flex-end;justify-content:center;padding:10px}.modal{background:#fff;border:1px solid #ddd;border-radius:16px;width:min(620px,100%);max-height:90vh;overflow:auto;padding:20px;animation:slide .2s ease}@keyframes slide{from{transform:translateY(20px);opacity:.5}to{transform:none;opacity:1}}.modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}.modal form{display:flex;flex-direction:column;gap:14px}.modal label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:650}.modal textarea{min-height:105px;resize:vertical}.file-label{position:relative;text-align:center;display:block;cursor:pointer}.file-label input{position:absolute;inset:0;opacity:0;cursor:pointer}.or{text-align:center;color:#999;font-size:12px;margin:15px 0}.import-text{min-height:160px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.settings{display:flex;flex-direction:column;gap:10px}.bottom-nav{position:fixed;bottom:0;left:0;right:0;height:68px;background:rgba(255,255,255,.96);border-top:1px solid #e5e5e5;display:grid;grid-template-columns:repeat(4,1fr);z-index:30;backdrop-filter:blur(10px)}.nav-item{border:0;background:none;color:#888;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;font-size:10px}.nav-item.active{color:#171717;font-weight:700}.nav-icon{position:relative;font-size:17px;line-height:19px}.nav-icon b{position:absolute;top:-6px;left:11px;background:#171717;color:#fff;border-radius:99px;font-size:8px;padding:2px 4px}.toast{position:fixed;bottom:82px;left:50%;transform:translateX(-50%);background:#171717;color:#fff;padding:10px 14px;border-radius:9px;font-size:13px;z-index:80;white-space:nowrap}@media(max-width:700px){.main{padding:22px 14px}.hero{display:block}.hero .primary{width:100%;margin-top:20px}.stats-grid{grid-template-columns:repeat(2,1fr);gap:7px}.deck-cards{grid-template-columns:1fr}.decks-layout{display:block}.deck-sidebar{border-right:0;border-bottom:1px solid #e7e7e7;padding:0 0 12px;margin-bottom:15px;max-height:230px;overflow:auto}.deck-header{display:block}.deck-header .button-row{margin-top:14px}.card-row{display:block}.card-meta{display:block;margin-top:9px}.rating-grid{grid-template-columns:repeat(2,1fr)}.flashcard{min-height:430px;padding:22px}.stat-panels{grid-template-columns:1fr}.page-title{align-items:center}.page-title .primary{padding:9px 11px}.button-row .danger{width:auto}.review-page{padding-top:8px}.modal-backdrop{padding:0}.modal{border-radius:16px 16px 0 0;max-height:92vh}.home-deck{min-height:62px}}@media(min-width:701px){.bottom-nav{position:static;max-width:1100px;margin:0 auto;border:0;background:transparent;display:flex;justify-content:center;gap:20px}.nav-item{padding:8px 15px}.app{padding-bottom:0}.toast{bottom:25px}}
+`;
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode><App /></React.StrictMode>
+);
+  </script>
+</body>
+</html>
